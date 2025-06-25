@@ -4,6 +4,7 @@
 #include <dirent.h>
 #include <stdio.h>
 #include <time.h>
+#include <sys/statvfs.h>
 
 #define __FILENAME__ "rlsys"
 
@@ -175,12 +176,12 @@ int rl_get_file_abs_path(char *buf, unsigned int len,const char *file_path)
     return RL_SUCCESS;
 }
 
-// 获取使用的文件句柄数量
-int rl_get_fd_count()
+// 获取进程使用的文件句柄数量
+int rl_get_self_proc_fd_count()
 {
     char path[64] = {0};
     // 获取当前进程的文件描述符目录路径
-    snprintf(path, sizeof(path), "/proc/%d/fd", getpid()); 
+    snprintf(path, sizeof(path), SYS_PROC_FD_FILE_FORMAT, getpid());
 
     DIR *dir = opendir(path);
     if (dir == NULL)
@@ -210,13 +211,53 @@ int rl_get_fd_count()
     return count;
 }
 
-// 获取使用的内存情况（单位是 KB）
-int rl_get_memory_usage()
+// 通过PID获取进程使用的文件句柄数量
+int rl_get_proc_fd_count_by_pid(pid_t pid)
 {
-    FILE *fp = fopen(SYS_PROC_GET_STATUS_FILE, "r");
+    if (pid <= 0)
+    {
+        rl_log_error("[%s:%s:%d] invalid pid: %d", __FILENAME__, __FUNCTION__, __LINE__, pid);
+        return RL_FAILED;
+    }
+
+    char path[64] = {0};
+    snprintf(path, sizeof(path), SYS_PROC_FD_FILE_FORMAT, pid);
+
+    DIR *dir = opendir(path);
+    if (dir == NULL)
+    {
+        rl_log_error("[%s:%s:%d] open dir:%s failed, errno=%d", __FILENAME__, __FUNCTION__, __LINE__, path, errno);
+        return RL_FAILED;
+    }
+
+    int count = 0;
+    struct dirent *entry;
+
+    while ((entry = readdir(dir)) != NULL)
+    {
+        // 排除 . 和 ..
+        if (entry->d_name[0] != '.')
+        {
+            count++;
+        }
+    }
+
+    if (closedir(dir) != 0)
+    {
+        rl_log_error("[%s:%s:%d] close dir:%s failed, errno=%d", __FILENAME__, __FUNCTION__, __LINE__, path, errno);
+        return RL_FAILED;
+    }
+
+    return count;
+}
+
+// 获取当前进程使用的运行内存情况（单位 KB）
+int rl_get_self_proc_memory_usage()
+{
+    FILE *fp = fopen(SYS_PROC_SELF_STATUS_FILE, "r");
     if (fp == NULL)
     {
-        rl_log_error("[%s:%s:%d] open file:%s failed", __FILENAME__, __FUNCTION__, __LINE__, SYS_PROC_GET_STATUS_FILE);
+        rl_log_error("[%s:%s:%d] open file:%s failed", __FILENAME__, __FUNCTION__, __LINE__, SYS_PROC_SELF_STATUS_FILE);
         return RL_FAILED;
     }
 
@@ -241,11 +282,195 @@ int rl_get_memory_usage()
 
     if (memory_usage == -1)
     {
-        rl_log_error("[%s:%s:%d] VmRSS not found in file:%s", __FILENAME__, __FUNCTION__, __LINE__, SYS_PROC_GET_STATUS_FILE);
+        rl_log_error("[%s:%s:%d] VmRSS not found in file:%s", __FILENAME__, __FUNCTION__, __LINE__, SYS_PROC_SELF_STATUS_FILE);
         return RL_FAILED;
     }
 
     return memory_usage;
+}
+
+// 通过pid获取进程使用的运行内存情况（单位 KB）
+int rl_get_proc_memory_usage_by_pid(pid_t pid)
+{
+    if (pid <= 0)
+    {
+        rl_log_error("[%s:%s:%d] invalid pid: %d", __FILENAME__, __FUNCTION__, __LINE__, pid);
+        return RL_FAILED;
+    }
+
+    char path[128];
+    snprintf(path, sizeof(path), SYS_PROC_STATUS_PATH_FORMAT, pid);
+
+    FILE *fp = fopen(path, "r");
+    if (fp == NULL)
+    {
+        rl_log_error("[%s:%s:%d] open file:%s failed", __FILENAME__, __FUNCTION__, __LINE__, path);
+        return RL_FAILED;
+    }
+
+    char line[256];
+    int memory_usage = -1;
+
+    // 读取每一行并查找 VmRSS 字段
+    while (fgets(line, sizeof(line), fp))
+    {
+        if (strncmp(line, "VmRSS:", 6) == 0)
+        {
+            if (sscanf(line, "VmRSS: %d kB", &memory_usage) == 1)
+            {
+                break;
+            }
+        }
+    }
+
+    fclose(fp);
+
+    if (memory_usage == -1)
+    {
+        rl_log_error("[%s:%s:%d] VmRSS not found in file:%s", __FILENAME__, __FUNCTION__, __LINE__, path);
+        return RL_FAILED;
+    }
+
+    return memory_usage;
+}
+
+// 通过进程名称获取pid
+int rl_get_proc_pid_by_name(const char *proc_name)
+{
+    if (rl_str_isempty(proc_name) == RL_TRUE)
+    {
+        rl_log_error("[%s:%s:%d] proc_name is null", __FILENAME__, __FUNCTION__, __LINE__);
+        return RL_FAILED;
+    }
+
+    DIR *dir = opendir(SYS_PROC_DIR);
+    if (dir == NULL)
+    {
+        rl_log_error("[%s:%s:%d] opendir failed", __FILENAME__, __FUNCTION__, __LINE__);
+        return RL_FAILED;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        // 只处理数字开头的目录
+        if (!isdigit(entry->d_name[0]))
+        {
+            continue;
+        }
+
+        char path[256];
+        snprintf(path, sizeof(path), SYS_PROC_NAME_FORMAT, entry->d_name);
+        FILE *fp = fopen(path, "r");
+        if (fp == NULL)
+        {
+            continue;
+        }
+
+        char name[256];
+        if (fgets(name, sizeof(name), fp))
+        {
+            name[strcspn(name, "\n")] = '\0';
+            if (strcmp(name, proc_name) == 0)
+            {
+                fclose(fp);
+                closedir(dir);
+                return atoi(entry->d_name);
+            }
+        }
+        fclose(fp);
+    }
+    closedir(dir);
+
+    return RL_FAILED;
+}
+
+// 获取系统的总运行内存
+int rl_get_sys_memory_total()
+{
+    FILE *fp = fopen(SYS_PROC_MEMORY_INFO_FILE, "r");
+    if (fp == NULL)
+    {
+        rl_log_error("[%s:%s:%d] open file:%s failed", __FILENAME__, __FUNCTION__, __LINE__, SYS_PROC_MEMORY_INFO_FILE);
+        return RL_FAILED;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), fp))
+    {
+        if (strncmp(line, "MemTotal:", 9) == 0)
+        {
+            unsigned int total = RL_INVALID;
+            sscanf(line, "MemTotal: %u kB", &total);
+            fclose(fp);
+            return total;
+        }
+    }
+    fclose(fp);
+
+    rl_log_error("[%s:%s:%d] parse file:%s failed", __FILENAME__, __FUNCTION__, __LINE__, SYS_PROC_MEMORY_INFO_FILE);
+    return RL_FAILED;
+}
+
+// 获取系统可用运行内存
+int rl_get_sys_memory_available()
+{
+    FILE *fp = fopen(SYS_PROC_MEMORY_INFO_FILE, "r");
+    if (fp == NULL)
+    {
+        rl_log_error("[%s:%s:%d] open file:%s failed", __FILENAME__, __FUNCTION__, __LINE__, SYS_PROC_MEMORY_INFO_FILE);
+        return RL_FAILED;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), fp))
+    {
+        if (strncmp(line, "MemAvailable:", 13) == 0)
+        {
+            unsigned int available = RL_INVALID;
+            sscanf(line, "MemAvailable: %u kB", &available);
+            fclose(fp);
+            return available;
+        }
+    }
+    fclose(fp);
+
+    rl_log_error("[%s:%s:%d] parse file:%s failed", __FILENAME__, __FUNCTION__, __LINE__, SYS_PROC_MEMORY_INFO_FILE);
+    return RL_FAILED;
+}
+
+// 获取根目录文件系统的总存储大小
+int rl_get_sys_storage_total_mb()
+{
+    struct statvfs fs;
+
+    if (statvfs(SYS_ROOT_PATH, &fs) != 0)
+    {
+        rl_log_error("[%s:%s:%d] statvfs failed for path:%s", __FILENAME__, __FUNCTION__, __LINE__, SYS_ROOT_PATH);
+        return RL_FAILED;
+    }
+
+    u_int64_t total_bytes = (u_int64_t)fs.f_blocks * fs.f_frsize;
+    unsigned long total_mb = total_bytes / (1024 * 1024);
+
+    return (int)total_mb;
+}
+
+// 获取根目录文件系统的可用存储大小
+int rl_get_sys_storage_available_mb()
+{
+    struct statvfs fs;
+
+    if (statvfs(SYS_ROOT_PATH, &fs) != 0)
+    {
+        rl_log_error("[%s:%s:%d] statvfs failed for path:%s", __FILENAME__, __FUNCTION__, __LINE__, SYS_ROOT_PATH);
+        return RL_FAILED;
+    }
+
+    u_int64_t avail_bytes = (u_int64_t)fs.f_bavail * fs.f_frsize;
+    unsigned long avail_mb = avail_bytes / (1024 * 1024);
+
+    return (int)avail_mb;
 }
 
 // 获取当前进程的名称
