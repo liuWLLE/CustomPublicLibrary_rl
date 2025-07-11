@@ -8,7 +8,7 @@ static pthread_mutex_t rl_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 // rl_log文件句柄
 static int log_file_fd = -1;
 // 进程pid
-static pid_t pid_now;
+static pid_t pid_now = 0;
 // 进程名称（一般小于16个字符）
 static char proc_name[17] = {0};
 // 日志等级
